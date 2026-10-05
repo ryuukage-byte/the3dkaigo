@@ -1,0 +1,6 @@
+{
+  "name": "Kaigo 3D Facility - Japanese Care Home Environment",
+  "description": "A high-performance, navigable 3D environment prototype of a Japanese elderly-care (Kaigo) facility built with Three.js, featuring realistic human-scale dimensions and barrier-free circulation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
