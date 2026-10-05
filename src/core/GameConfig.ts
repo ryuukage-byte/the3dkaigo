@@ -22,7 +22,13 @@ export const GameConfig = {
     radius: 0.32, // Collision cylinder / box radius
     walkSpeed: 2.4, // m/s (caregiver walking pace)
     runSpeed: 4.2, // m/s (swift response pace)
+    mass: 70, // kg, used when pushing props
     jumpVelocity: 4.0,
+    gravity: 15.0, // m/s^2 (snappier than 9.81, feels better for a short hop)
+    acceleration: 22.0, // m/s^2 ramp up to walk/run speed
+    deceleration: 30.0, // m/s^2 ramp down when input is released
+    pushSpeedScale: 0.7, // speed multiplier while pushing a wheelchair
+    turnSpeed: 14.0, // 1/s, avatar body turn smoothing
     spawnPosition: { x: -6.8, y: 0.0, z: -4.8 }, // Inside Locker Room (更衣室)
     spawnRotation: 0, // facing toward corridor
     defaultViewMode: 'firstPerson' as 'firstPerson' | 'thirdPerson',
@@ -36,6 +42,22 @@ export const GameConfig = {
     near: 0.05,
     far: 80.0,
     sensitivity: 0.0025,
+  },
+  loop: {
+    maxFrameDelta: 0.05, // s; longer frames (tab freeze, hitch) are clamped
+    maxStep: 1 / 60, // s; frames are split into sub-steps no longer than this
+  },
+  interaction: {
+    rayHz: 30, // crosshair raycast rate
+    cooldown: 0.25, // s between accepted interactions
+    reach: 2.4, // m from the player's eye, upper bound for any target
+  },
+  ui: {
+    updateHz: 15, // HUD state push rate (discrete changes are pushed immediately)
+  },
+  debug: {
+    // Master switch. false = F3 / debug button / overlays do nothing (production).
+    enabled: import.meta.env.DEV as boolean,
   },
   graphics: {
     shadows: true,

@@ -116,7 +116,7 @@ export function createTable(options: TableOptions): THREE.Group {
 
   if (isMovable) {
     const mass = options.mass ?? (type === 'bedside' ? 18 : type === 'dining' ? 26 : 32);
-    const radius = Math.max(width, depth) * 0.45;
+    const radius = Math.hypot(width, depth) * 0.5 * 0.75; // circle approximating the footprint
 
     const body = physicsWorld.register({
       id: options.name ?? `table_${Math.round(options.position.x * 100)}_${Math.round(options.position.z * 100)}`,
@@ -126,10 +126,10 @@ export function createTable(options: TableOptions): THREE.Group {
       mass,
       radius,
       height,
-      friction: 0.72,
+      friction: 0.5,      // heavy: stops quickly once you stop pushing
       restitution: 0.1,
-      linearDamping: 5.2,
-      angularDamping: 6.0,
+      linearDamping: 1.0,
+      angularDamping: 5.0,
     });
     group.userData.physicalBody = body;
   } else {

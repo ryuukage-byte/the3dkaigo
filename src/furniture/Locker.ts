@@ -204,7 +204,7 @@ export class LockerUnit {
     this.currentDoorAngle = THREE.MathUtils.lerp(
       this.currentDoorAngle,
       this.targetDoorAngle,
-      10 * delta
+      1 - Math.exp(-10 * delta)
     );
     this.interactiveDoorGroup.rotation.y = this.currentDoorAngle;
   }

@@ -165,10 +165,10 @@ export function createChair(options: ChairOptions): THREE.Group {
         mass,
         radius,
         height,
-        friction: 0.65,
+        friction: 0.35,     // slides ~1m after a shove
         restitution: 0.15,
-        linearDamping: 4.8,
-        angularDamping: 5.5,
+        linearDamping: 0.8,
+        angularDamping: 4.0,
       });
       group.userData.physicalBody = body;
     } else {

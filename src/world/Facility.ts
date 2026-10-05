@@ -54,9 +54,6 @@ export class Facility {
 
   public update(delta: number) {
     this.lockerUnit?.update(delta);
-    for (const wc of this.wheelchairs) {
-      wc.updatePhysics(delta);
-    }
   }
 
   private buildArchitecture() {

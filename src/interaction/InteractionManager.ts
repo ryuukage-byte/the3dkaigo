@@ -1,32 +1,44 @@
 /**
  * InteractionManager.ts
- * Centralized First-Person Interaction Engine.
+ * Crosshair interaction: finds the interactable in front of the player and
+ * hands it to Game when E is pressed.
  *
- * Distinct Interaction Types:
- * 1. 'world': Direct physical interaction (Wheelchair handle, brake, door, bed, buttons).
- *    - Keeps FPS context, NO popups or generic action menus.
- *    - Executes action directly on [E].
+ * Lifecycle (explicit, one phase at a time):
+ *   IDLE     nothing in range / in sight
+ *   FOCUSED  crosshair is on a valid target (prompt + highlight shown)
+ *   ENGAGED  a UI interaction (e.g. locker menu) is open; raycast suspended
  *
- * 2. 'ui': Interface interaction (Staff Locker wardrobe, settings, custom menus).
- *    - Exits Pointer Lock, shows cursor, freezes FPS controls.
- *    - Restores FPS state cleanly when closed.
+ * Interaction types:
+ *   'world'  executes immediately in gameplay (door, brake, wheelchair grip)
+ *   'ui'     opens a menu and hands the screen over (state: INTERACTION)
+ *
+ * Cost control: raycast only against registered interactable roots (never the
+ * whole scene), at `rayHz`, and line-of-sight is checked against static
+ * collision boxes instead of scene meshes.
  */
 
 import * as THREE from 'three';
+import { collisionWorld } from '../world/CollisionWorld.ts';
+import { GameConfig } from '../core/GameConfig.ts';
 
 export type InteractionType = 'world' | 'ui';
+export type InteractionPhase = 'IDLE' | 'FOCUSED' | 'ENGAGED';
 
 export interface InteractionTarget {
   id: string;
-  type: InteractionType; // 'world' | 'ui'
+  type: InteractionType;
   objectName: string;    // e.g. "Kursi Roda"
   partName: string;      // e.g. "Pegangan", "Rem"
   action: string;        // e.g. "grab", "brake", "openOutfitMenu"
   label: string;         // e.g. "Pegang", "Rem", "Ganti Outfit"
   key?: string;          // default "E"
-  maxDistance: number;   // meters (e.g. 2.0m)
+  maxDistance: number;   // meters from the player's eye
   targetMesh: THREE.Object3D;
   onInteract: () => void;
+  /** Return false to hide the prompt and block E (e.g. wrong side of a wheelchair). */
+  canInteract?: () => boolean;
+  /** Called when a 'ui' interaction ends (menu closed). */
+  exitInteraction?: () => void;
   getStateText?: () => string | undefined;
   highlightMesh?: THREE.Mesh | THREE.Mesh[];
 }
@@ -44,150 +56,151 @@ export interface ActiveInteractionInfo {
 }
 
 export class InteractionManager {
-  private camera: THREE.PerspectiveCamera;
-  private raycaster: THREE.Raycaster = new THREE.Raycaster();
-  private targets: InteractionTarget[] = [];
-  private raycastMeshes: THREE.Object3D[] = [];
-  private meshToTargetMap: Map<THREE.Object3D, InteractionTarget> = new Map();
+  private readonly raycaster = new THREE.Raycaster();
+  private readonly ndcCenter = new THREE.Vector2(0, 0);
+  private readonly targets: InteractionTarget[] = [];
+  private roots: THREE.Object3D[] = [];
+  private readonly meshToTarget = new Map<THREE.Object3D, InteractionTarget>();
 
-  // Active state
+  private _phase: InteractionPhase = 'IDLE';
   public activeTarget: InteractionTarget | null = null;
   public activeInfo: ActiveInteractionInfo | null = null;
+  private engagedTarget: InteractionTarget | null = null;
 
-  // Highlight state
-  private currentlyHighlighted: THREE.Mesh[] = [];
-  private originalEmissives: Map<THREE.Mesh, { color: THREE.Color; intensity: number }> = new Map();
+  /** Player's eye position as of the last update (for canInteract checks). */
+  public readonly viewerPosition = new THREE.Vector3();
 
-  // Listeners
+  private rayTimer = 0;
+  private cooldown = 0;
+
+  // Highlight swaps in a private clone of the material so shared materials are never mutated
+  private highlighted: Array<{ mesh: THREE.Mesh; original: THREE.Material | THREE.Material[] }> = [];
+  private readonly highlightClones = new WeakMap<THREE.Mesh, THREE.Material>();
+
+  // scratch
+  private readonly dir = new THREE.Vector3();
+
   public onActiveTargetChange?: (info: ActiveInteractionInfo | null) => void;
 
-  constructor(camera: THREE.PerspectiveCamera) {
-    this.camera = camera;
-    this.raycaster.far = 10.0;
+  constructor(private readonly camera: THREE.PerspectiveCamera) {
+    this.raycaster.far = GameConfig.interaction.reach + 12; // 3P camera sits behind the player
   }
+
+  public get phase(): InteractionPhase {
+    return this._phase;
+  }
+
+  // ---- registration -----------------------------------------------------------
 
   public registerTarget(target: InteractionTarget) {
     this.targets.push(target);
-    this.raycastMeshes.push(target.targetMesh);
-    this.meshToTargetMap.set(target.targetMesh, target);
-
-    // Map all child meshes for robust hit testing
-    target.targetMesh.traverse((child) => {
-      this.meshToTargetMap.set(child, target);
-      if (!this.raycastMeshes.includes(child)) {
-        this.raycastMeshes.push(child);
-      }
-    });
+    this.roots.push(target.targetMesh);
+    target.targetMesh.traverse((child) => this.meshToTarget.set(child, target));
   }
 
   public unregisterTarget(targetId: string) {
     const idx = this.targets.findIndex((t) => t.id === targetId);
-    if (idx !== -1) {
-      const target = this.targets[idx];
-      this.targets.splice(idx, 1);
-      this.raycastMeshes = this.raycastMeshes.filter((m) => {
-        return m !== target.targetMesh && !this.isChildOf(m, target.targetMesh);
-      });
-      this.meshToTargetMap.delete(target.targetMesh);
-      target.targetMesh.traverse((child) => {
-        this.meshToTargetMap.delete(child);
-      });
-    }
+    if (idx === -1) return;
+    const target = this.targets[idx];
+    this.targets.splice(idx, 1);
+    this.roots = this.roots.filter((r) => r !== target.targetMesh);
+    target.targetMesh.traverse((child) => this.meshToTarget.delete(child));
+    if (this.activeTarget === target) this.clearActiveTarget();
   }
 
-  private isChildOf(child: THREE.Object3D, parent: THREE.Object3D): boolean {
-    let curr = child.parent;
-    while (curr) {
-      if (curr === parent) return true;
-      curr = curr.parent;
-    }
-    return false;
-  }
+  // ---- per frame ----------------------------------------------------------------
 
   /**
-   * Raycast from exact center of camera viewport (0, 0)
+   * @param dt      frame time
+   * @param origin  player's eye position (range + line of sight are measured from here,
+   *                which also makes interaction work in third person)
+   * @param enabled false while a menu / pause owns the screen
    */
-  public update() {
-    this.raycaster.setFromCamera(new THREE.Vector2(0, 0), this.camera);
+  public update(dt: number, origin: THREE.Vector3, enabled: boolean) {
+    this.cooldown = Math.max(0, this.cooldown - dt);
+    this.viewerPosition.copy(origin);
 
-    if (this.raycastMeshes.length === 0) {
+    if (!enabled || this._phase === 'ENGAGED') {
+      if (this._phase === 'FOCUSED') this.clearActiveTarget();
+      return;
+    }
+
+    this.rayTimer -= dt;
+    if (this.rayTimer > 0) return;
+    this.rayTimer = 1 / GameConfig.interaction.rayHz;
+
+    this.castRay(origin);
+  }
+
+  private castRay(origin: THREE.Vector3) {
+    if (this.roots.length === 0) {
       this.clearActiveTarget();
       return;
     }
 
-    const intersects = this.raycaster.intersectObjects(this.raycastMeshes, true);
+    this.camera.updateMatrixWorld(); // render() has not run yet this frame; do not ray from last frame's view
+    this.raycaster.setFromCamera(this.ndcCenter, this.camera);
+    const hits = this.raycaster.intersectObjects(this.roots, true);
 
-    if (intersects.length > 0) {
-      let foundTarget: InteractionTarget | null = null;
-      let hitDistance = Infinity;
+    for (const hit of hits) {
+      const target = this.findTarget(hit.object);
+      if (!target) continue;
 
-      for (const hit of intersects) {
-        let obj: THREE.Object3D | null = hit.object;
-        while (obj) {
-          if (this.meshToTargetMap.has(obj)) {
-            const target = this.meshToTargetMap.get(obj)!;
-            if (hit.distance <= target.maxDistance) {
-              foundTarget = target;
-              hitDistance = hit.distance;
-              break;
-            }
-          }
-          obj = obj.parent;
-        }
-        if (foundTarget) break;
+      const distance = hit.point.distanceTo(origin);
+      if (distance > Math.min(target.maxDistance, GameConfig.interaction.reach)) continue;
+      if (target.canInteract && !target.canInteract()) continue;
+
+      // Line of sight: static walls / furniture between the eye and the hit point
+      this.dir.subVectors(hit.point, origin);
+      const len = this.dir.length();
+      if (len > 1e-4) {
+        this.dir.divideScalar(len);
+        if (collisionWorld.raycast(origin, this.dir, len, hit.point) < len - 0.02) continue;
       }
 
-      if (foundTarget) {
-        if (this.activeTarget !== foundTarget) {
-          this.setActiveTarget(foundTarget, hitDistance);
-        } else {
-          this.updateActiveInfo(foundTarget, hitDistance);
-        }
-        return;
-      }
+      // First valid hit along the ray wins: the thing directly in front of the crosshair
+      this.focus(target, distance);
+      return;
     }
 
     this.clearActiveTarget();
   }
 
-  private setActiveTarget(target: InteractionTarget, distance: number) {
-    this.clearHighlight();
-    this.activeTarget = target;
-
-    // Apply highlight
-    const meshesToHighlight: THREE.Mesh[] = [];
-    if (target.highlightMesh) {
-      if (Array.isArray(target.highlightMesh)) {
-        meshesToHighlight.push(...target.highlightMesh);
-      } else {
-        meshesToHighlight.push(target.highlightMesh);
-      }
-    } else if (target.targetMesh instanceof THREE.Mesh) {
-      meshesToHighlight.push(target.targetMesh);
-    } else {
-      target.targetMesh.traverse((child) => {
-        if (child instanceof THREE.Mesh) meshesToHighlight.push(child);
-      });
+  private findTarget(obj: THREE.Object3D | null): InteractionTarget | null {
+    while (obj) {
+      const t = this.meshToTarget.get(obj);
+      if (t) return t;
+      obj = obj.parent;
     }
-
-    for (const mesh of meshesToHighlight) {
-      const mat = mesh.material;
-      if (mat instanceof THREE.MeshStandardMaterial) {
-        this.originalEmissives.set(mesh, {
-          color: mat.emissive.clone(),
-          intensity: mat.emissiveIntensity,
-        });
-        mat.emissive.set(0x38BDF8); // Subtle sky-blue highlight
-        mat.emissiveIntensity = 0.5;
-        this.currentlyHighlighted.push(mesh);
-      }
-    }
-
-    this.updateActiveInfo(target, distance);
+    return null;
   }
 
-  private updateActiveInfo(target: InteractionTarget, distance: number) {
-    const info: ActiveInteractionInfo = {
+  // ---- focus / highlight ------------------------------------------------------------
+
+  private focus(target: InteractionTarget, distance: number) {
+    if (this.activeTarget !== target) {
+      this.clearHighlight();
+      this.activeTarget = target;
+      this._phase = 'FOCUSED';
+      this.applyHighlight(target);
+    }
+    this.refreshInfo(target, distance);
+  }
+
+  private refreshInfo(target: InteractionTarget, distance: number) {
+    const stateText = target.getStateText ? target.getStateText() : undefined;
+    const rounded = Number(distance.toFixed(1));
+    const prev = this.activeInfo;
+    if (
+      prev &&
+      prev.targetId === target.id &&
+      prev.label === target.label &&
+      prev.stateText === stateText &&
+      prev.distance === rounded
+    ) {
+      return; // unchanged: keep identity so the UI does not re-render
+    }
+    this.activeInfo = {
       targetId: target.id,
       type: target.type,
       objectName: target.objectName,
@@ -195,53 +208,85 @@ export class InteractionManager {
       action: target.action,
       label: target.label,
       key: target.key ?? 'E',
-      distance: Number(distance.toFixed(1)),
-      stateText: target.getStateText ? target.getStateText() : undefined,
+      distance: rounded,
+      stateText,
     };
-    this.activeInfo = info;
-    this.onActiveTargetChange?.(info);
+    this.onActiveTargetChange?.(this.activeInfo);
   }
 
+  /** Re-reads label/state text of the focused target (call after an interaction changed it). */
   public refreshActiveTarget() {
-    if (this.activeTarget && this.activeInfo) {
-      if (this.activeTarget.getStateText) {
-        this.activeInfo.stateText = this.activeTarget.getStateText();
-      }
-      this.activeInfo.label = this.activeTarget.label;
-      this.onActiveTargetChange?.({ ...this.activeInfo });
-    }
+    if (this.activeTarget && this.activeInfo) this.refreshInfo(this.activeTarget, this.activeInfo.distance);
   }
 
   public clearActiveTarget() {
-    if (this.activeTarget !== null) {
-      this.clearHighlight();
-      this.activeTarget = null;
-      this.activeInfo = null;
-      this.onActiveTargetChange?.(null);
+    if (this.activeTarget === null && this._phase !== 'FOCUSED') return;
+    this.clearHighlight();
+    this.activeTarget = null;
+    this.activeInfo = null;
+    if (this._phase === 'FOCUSED') this._phase = 'IDLE';
+    this.onActiveTargetChange?.(null);
+  }
+
+  private applyHighlight(target: InteractionTarget) {
+    const meshes: THREE.Mesh[] = [];
+    if (target.highlightMesh) {
+      Array.isArray(target.highlightMesh) ? meshes.push(...target.highlightMesh) : meshes.push(target.highlightMesh);
+    } else if (target.targetMesh instanceof THREE.Mesh) {
+      meshes.push(target.targetMesh);
+    } else {
+      target.targetMesh.traverse((c) => { if (c instanceof THREE.Mesh) meshes.push(c); });
+    }
+
+    for (const mesh of meshes) {
+      const mat = mesh.material;
+      if (Array.isArray(mat) || !(mat instanceof THREE.MeshStandardMaterial)) continue;
+      let clone = this.highlightClones.get(mesh) as THREE.MeshStandardMaterial | undefined;
+      if (!clone) {
+        clone = mat.clone();
+        clone.emissive.set(0x38bdf8);
+        clone.emissiveIntensity = 0.5;
+        this.highlightClones.set(mesh, clone);
+      }
+      this.highlighted.push({ mesh, original: mat });
+      mesh.material = clone;
     }
   }
 
-  public clearHighlight() {
-    for (const mesh of this.currentlyHighlighted) {
-      const orig = this.originalEmissives.get(mesh);
-      if (orig && mesh.material instanceof THREE.MeshStandardMaterial) {
-        mesh.material.emissive.copy(orig.color);
-        mesh.material.emissiveIntensity = orig.intensity;
-      }
-    }
-    this.currentlyHighlighted = [];
-    this.originalEmissives.clear();
+  private clearHighlight() {
+    for (const { mesh, original } of this.highlighted) mesh.material = original;
+    this.highlighted.length = 0;
   }
+
+  // ---- activation --------------------------------------------------------------------
 
   /**
-   * Executes the active interaction directly
+   * Called when E is pressed. Returns the focused target if it may be used now
+   * (cooldown elapsed, still interactable), else null. Caller executes it.
    */
-  public triggerActiveInteraction(): boolean {
-    if (this.activeTarget) {
-      this.activeTarget.onInteract();
-      this.refreshActiveTarget();
-      return true;
-    }
-    return false;
+  public tryInteract(): InteractionTarget | null {
+    const target = this.activeTarget;
+    if (!target || this._phase !== 'FOCUSED' || this.cooldown > 0) return null;
+    if (target.canInteract && !target.canInteract()) return null;
+    this.cooldown = GameConfig.interaction.cooldown;
+    return target;
+  }
+
+  /** A UI interaction took over: stop raycasting, remember what to exit. */
+  public beginEngagement(target: InteractionTarget | null) {
+    this.clearActiveTarget();
+    this.engagedTarget = target;
+    this._phase = 'ENGAGED';
+  }
+
+  /** The UI interaction ended: back to IDLE and run the target's exit hook once. */
+  public endEngagement() {
+    if (this._phase !== 'ENGAGED') return;
+    const target = this.engagedTarget;
+    this.engagedTarget = null;
+    this._phase = 'IDLE';
+    this.cooldown = GameConfig.interaction.cooldown; // closing with E must not instantly reopen
+    this.rayTimer = 0;
+    target?.exitInteraction?.();
   }
 }

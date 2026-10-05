@@ -2,29 +2,32 @@
  * Wheelchair.ts
  * Physically interactive Japanese care wheelchair (自走・介助兼用車いす).
  *
- * Physical State:
- * - brakeLocked: controls whether wheelchair resists movement or rolls freely
- * - isGrabbed: player is physically holding and pushing the handles
- * - isMoving: dynamic velocity and wheel roll animation
+ * The wheelchair is a regular PhysicsWorld body (same solver as chairs/tables)
+ * with wheel behaviour on top: low rolling friction, lateral grip, parking brake.
+ * Nothing here moves the group directly; PhysicsWorld does.
  *
- * Physical Behaviors:
- * - Direct collision with walls, doors, furniture, and player
- * - Rotational wheels & front castors responding to velocity
- * - Push impulse response when bumped while brake is released
- * - Physical movement constraint when pushed by caregiver
+ * Logical state (derived, never stored twice):
+ *   BRAKED        brake locked, nobody holding         -> immovable
+ *   UNBRAKED      brake released, nobody holding       -> rolls when bumped, then coasts to a stop
+ *   BEING_PUSHED  player holds the grips, brake off    -> follows the caregiver via the grip joint
+ *   IDLE          unbraked, resting (not moving)
+ *   OCCUPIED      someone is seated (heavier); reserved for resident NPCs
+ * Holding with the brake ON keeps BRAKED: the caregiver is held in place by it.
  */
 
 import * as THREE from 'three';
 import { materials } from '../world/Materials.ts';
-import { collisionWorld } from '../world/CollisionWorld.ts';
 import { InteractionManager } from '../interaction/InteractionManager.ts';
 import { soundManager } from '../utils/AudioEffects.ts';
 import { physicsWorld, PhysicalBody } from '../physics/PhysicsWorld.ts';
+
+export type WheelchairMode = 'IDLE' | 'BRAKED' | 'UNBRAKED' | 'BEING_PUSHED' | 'OCCUPIED';
 
 export interface WheelchairPhysicalState {
   brakeLocked: boolean;
   isGrabbed: boolean;
   isMoving: boolean;
+  isOccupied: boolean;
 }
 
 export interface WheelchairOptions {
@@ -35,6 +38,12 @@ export interface WheelchairOptions {
   onToggleHold?: (wheelchair: WheelchairInstance, isHolding: boolean) => void;
 }
 
+function makeHitbox(w: number, h: number, d: number): THREE.Mesh {
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshBasicMaterial({ visible: false }));
+  mesh.name = 'interaction_hitbox';
+  return mesh;
+}
+
 export class WheelchairInstance {
   public readonly group: THREE.Group = new THREE.Group();
 
@@ -43,21 +52,19 @@ export class WheelchairInstance {
     brakeLocked: true,
     isGrabbed: false,
     isMoving: false,
+    isOccupied: false,
   };
-
-  // Backward compatibility getters/setters
-  public get isBrakeLocked(): boolean {
-    return this.state.brakeLocked;
-  }
-  public set isBrakeLocked(val: boolean) {
-    this.state.brakeLocked = val;
-  }
 
   public get isHolding(): boolean {
     return this.state.isGrabbed;
   }
-  public set isHolding(val: boolean) {
-    this.state.isGrabbed = val;
+
+  public get mode(): WheelchairMode {
+    const s = this.state;
+    if (s.isOccupied) return 'OCCUPIED';
+    if (s.brakeLocked) return 'BRAKED';
+    if (s.isGrabbed) return 'BEING_PUSHED';
+    return s.isMoving ? 'UNBRAKED' : 'IDLE';
   }
 
   public isFootrestFolded: boolean = false;
@@ -65,11 +72,12 @@ export class WheelchairInstance {
 
   // Physics properties
   public physicalBody!: PhysicalBody;
-  public velocity: THREE.Vector3 = new THREE.Vector3();
   public currentSpeed: number = 0;
-  public collisionBoxName: string;
-  public collisionRadius: number = 0.38;
+  public readonly bodyId: string;
+  public collisionRadius: number = 0.42;
   public collisionHeight: number = 0.95;
+  private static readonly EMPTY_MASS = 24;
+  private static readonly OCCUPANT_MASS = 65;
 
   // Wheel rolling physics
   public wheelAngle: number = 0;
@@ -80,35 +88,35 @@ export class WheelchairInstance {
   // Interaction target meshes
   public handleMeshes: THREE.Mesh[] = [];
   public brakeMeshes: THREE.Mesh[] = [];
+  /** Invisible, generous hit volumes: the real grips/levers are ~2cm thick and impossible to aim at. */
+  public handleHitbox!: THREE.Mesh;
+  public brakeHitboxes: THREE.Mesh[] = [];
   public seatMesh!: THREE.Mesh;
   public footrestMeshes: THREE.Mesh[] = [];
 
   constructor(options: WheelchairOptions) {
-    this.collisionBoxName = options.name ?? `wheelchair_${Math.round(options.position.x * 10)}`;
+    this.bodyId = options.name ?? `wheelchair_${Math.round(options.position.x * 10)}_${Math.round(options.position.z * 10)}`;
     this.onToggleHold = options.onToggleHold;
     this.build(options);
 
-    // Register with central PhysicsWorld
+    // Register with central PhysicsWorld (the single source of truth for movement)
     this.physicalBody = physicsWorld.register({
-      id: this.collisionBoxName,
+      id: this.bodyId,
       name: options.name ?? 'wheelchair',
       group: this.group,
       movable: true,
-      mass: 24,
+      mass: WheelchairInstance.EMPTY_MASS,
       radius: this.collisionRadius,
       height: this.collisionHeight,
-      friction: 0.7,
+      friction: 0.12,        // rolling resistance: coasts ~2m from walking speed
       restitution: 0.12,
-      linearDamping: 4.8,
-      angularDamping: 6.0,
-      isLocked: () => this.state.brakeLocked || this.state.isGrabbed,
+      linearDamping: 0.25,
+      angularDamping: 4.0,
+      lateralGrip: 6.0,      // wheels resist sideways sliding
+      isLocked: () => this.state.brakeLocked,
       onMove: (deltaMove, speed) => {
-        const forward = new THREE.Vector3(0, 0, 1).applyAxisAngle(
-          new THREE.Vector3(0, 1, 0),
-          this.group.rotation.y
-        );
-        const distAlongForward = deltaMove.dot(forward);
-        this.rollWheels(distAlongForward);
+        const yaw = this.group.rotation.y;
+        this.rollWheels(deltaMove.x * Math.sin(yaw) + deltaMove.z * Math.cos(yaw));
         this.currentSpeed = speed;
         this.state.isMoving = speed > 0.05;
       },
@@ -170,6 +178,10 @@ export class WheelchairInstance {
       this.handleMeshes.push(grip);
       this.group.add(grip);
     }
+
+    this.handleHitbox = makeHitbox(0.5, 0.26, 0.24);
+    this.handleHitbox.position.set(0, seatH + 0.52, -seatD / 2 - 0.08);
+    this.group.add(this.handleHitbox);
 
     // 5. Armrests
     for (const ax of [-seatW / 2 - 0.02, seatW / 2 + 0.02]) {
@@ -235,6 +247,10 @@ export class WheelchairInstance {
       brakePivot.add(lever);
 
       this.brakeMeshes.push(lever);
+      const brakeHit = makeHitbox(0.14, 0.22, 0.16);
+      brakeHit.position.set(0, 0.06, 0);
+      brakePivot.add(brakeHit);
+      this.brakeHitboxes.push(brakeHit);
       this.group.add(brakePivot);
     }
 
@@ -281,27 +297,6 @@ export class WheelchairInstance {
     if (options.rotationY) {
       this.group.rotation.y = options.rotationY;
     }
-
-    // Register initial physical collider in CollisionWorld
-    this.updateCollider();
-  }
-
-  /**
-   * Updates physical AABB box collider in CollisionWorld
-   */
-  public updateCollider() {
-    const halfW = 0.65 / 2;
-    const halfD = 0.95 / 2;
-    const rotY = this.group.rotation.y;
-    const extentX = Math.abs(Math.cos(rotY) * halfW) + Math.abs(Math.sin(rotY) * halfD);
-    const extentZ = Math.abs(Math.sin(rotY) * halfW) + Math.abs(Math.cos(rotY) * halfD);
-
-    const pos = this.group.position;
-    collisionWorld.updateBox(
-      this.collisionBoxName,
-      new THREE.Vector3(pos.x - extentX, 0, pos.z - extentZ),
-      new THREE.Vector3(pos.x + extentX, 0.95, pos.z + extentZ)
-    );
   }
 
   /**
@@ -327,47 +322,18 @@ export class WheelchairInstance {
     }
   }
 
-  /**
-   * Applies push impulse when physically bumped by the player or other objects
-   */
-  public applyPushImpulse(impulse: THREE.Vector3) {
-    if (this.physicalBody) {
-      this.physicalBody.applyImpulse(impulse);
-    }
+  /** Marks the chair as seated (adds the occupant's mass). */
+  public setOccupied(occupied: boolean) {
+    this.state.isOccupied = occupied;
+    this.physicalBody.mass = WheelchairInstance.EMPTY_MASS + (occupied ? WheelchairInstance.OCCUPANT_MASS : 0);
   }
 
-  /**
-   * General physics simulation update (synced with PhysicsWorld)
-   */
-  public updatePhysics(delta: number) {
-    if (this.state.isGrabbed) {
-      if (this.physicalBody) {
-        this.physicalBody.position.copy(this.group.position);
-        this.physicalBody.rotationY = this.group.rotation.y;
-        this.physicalBody.velocity.set(0, 0, 0);
-        this.physicalBody.angularVelocity = 0;
-      }
-    } else {
-      if (this.physicalBody) {
-        this.velocity.copy(this.physicalBody.velocity);
-        this.currentSpeed = this.physicalBody.velocity.length();
-      }
-    }
-
-    this.updateCollider();
-  }
-
-  /**
-   * Position of caregiver hands behind push handles
-   */
-  public getPlayerPushPosition(): THREE.Vector3 {
-    const standOffset = new THREE.Vector3(0, 0, -0.42 / 2 - 0.48);
-    standOffset.applyAxisAngle(new THREE.Vector3(0, 1, 0), this.group.rotation.y);
-    return this.group.position.clone().add(standOffset);
-  }
-
-  public getPlayerPushYaw(): number {
-    return this.group.rotation.y + Math.PI;
+  /** True when `p` stands on the push-handle side (rear half-plane). */
+  public isBehind(p: THREE.Vector3): boolean {
+    const yaw = this.group.rotation.y;
+    const dx = p.x - this.group.position.x;
+    const dz = p.z - this.group.position.z;
+    return dx * Math.sin(yaw) + dz * Math.cos(yaw) < 0;
   }
 
   public toggleHold() {
@@ -385,7 +351,6 @@ export class WheelchairInstance {
     }
 
     if (this.state.brakeLocked) {
-      this.velocity.set(0, 0, 0);
       this.state.isMoving = false;
       soundManager.playLockerClose();
     } else {
@@ -394,35 +359,36 @@ export class WheelchairInstance {
   }
 
   public registerInteractions(manager: InteractionManager, namePrefix: string) {
+    const self = this; // live-label getter below needs the instance
     // 1. Pegangan / Handle Direct Physical Interaction
-    for (let i = 0; i < this.handleMeshes.length; i++) {
-      const handle = this.handleMeshes[i];
-      manager.registerTarget({
-        id: `${namePrefix}_handle_${i}`,
-        type: 'world',
-        objectName: 'Kursi Roda (Wheelchair)',
-        partName: 'Pegangan Belakang',
-        action: 'grab',
-        label: this.state.isGrabbed ? 'Lepas Pegang' : 'Pegang',
-        key: 'E',
-        maxDistance: 2.2,
-        targetMesh: handle,
-        highlightMesh: this.handleMeshes,
-        getStateText: () =>
-          this.state.isGrabbed
-            ? this.state.brakeLocked
-              ? 'Dipegang (Rem Terkunci)'
-              : 'Dipegang (Siap Didorong)'
-            : undefined,
-        onInteract: () => {
-          this.toggleHold();
-        },
-      });
-    }
+    manager.registerTarget({
+      id: `${namePrefix}_handle`,
+      type: 'world',
+      objectName: 'Kursi Roda (Wheelchair)',
+      partName: 'Pegangan Belakang',
+      action: 'grab',
+      get label() {
+        return self.state.isGrabbed ? 'Lepas Pegang' : 'Pegang';
+      },
+      key: 'E',
+      maxDistance: 2.2,
+      targetMesh: this.handleHitbox,
+      highlightMesh: this.handleMeshes,
+      // Grips are only offered from the rear (so the caregiver never has to walk through the chair)
+      canInteract: () => this.state.isGrabbed || this.isBehind(manager.viewerPosition),
+      getStateText: () =>
+        this.state.isGrabbed
+          ? this.state.brakeLocked
+            ? 'Dipegang (Rem Terkunci)'
+            : 'Dipegang (Siap Didorong)'
+          : undefined,
+      onInteract: () => {
+        this.toggleHold();
+      },
+    });
 
     // 2. Rem / Brake Direct Physical Interaction
-    for (let i = 0; i < this.brakeMeshes.length; i++) {
-      const brake = this.brakeMeshes[i];
+    for (let i = 0; i < this.brakeHitboxes.length; i++) {
       manager.registerTarget({
         id: `${namePrefix}_brake_${i}`,
         type: 'world',
@@ -432,7 +398,7 @@ export class WheelchairInstance {
         label: 'Rem',
         key: 'E',
         maxDistance: 2.2,
-        targetMesh: brake,
+        targetMesh: this.brakeHitboxes[i],
         highlightMesh: this.brakeMeshes,
         getStateText: () => (this.state.brakeLocked ? 'Terkunci (Locked)' : 'Bebas (Released)'),
         onInteract: () => {
