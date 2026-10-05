@@ -12,7 +12,8 @@ import { LockerInteractionModal } from './LockerInteractionModal.tsx';
 import { Crosshair } from './Crosshair.tsx';
 import { OutfitConfig } from '../player/PlayerAvatar.ts';
 import { ActiveInteractionInfo } from '../interaction/InteractionManager.ts';
-import { Game, GameMode } from '../core/Game.ts';
+import { Game, GameState, GameUIState } from '../core/Game.ts';
+import { GameConfig } from '../core/GameConfig.ts';
 import {
   Compass,
   Activity,
@@ -42,8 +43,9 @@ interface HUDProps {
   isChangingClothesModalOpen: boolean;
   currentOutfit: OutfitConfig;
   activeInteraction: ActiveInteractionInfo | null;
-  gameMode: GameMode;
+  gameState: GameState;
   isHoldingWheelchair: boolean;
+  debugInfo: GameUIState;
 }
 
 export const HUD: React.FC<HUDProps> = ({
@@ -61,8 +63,9 @@ export const HUD: React.FC<HUDProps> = ({
   isChangingClothesModalOpen,
   currentOutfit,
   activeInteraction,
-  gameMode,
+  gameState,
   isHoldingWheelchair,
+  debugInfo,
 }) => {
   const [showTeleportMenu, setShowTeleportMenu] = useState(false);
   const [camDist, setCamDist] = useState(3.8);
@@ -80,7 +83,7 @@ export const HUD: React.FC<HUDProps> = ({
         activeInteraction={activeInteraction}
         onTriggerInteraction={() => game.triggerInteraction()}
         isFirstPerson={viewMode === 'firstPerson'}
-        isMenuOpen={gameMode === 'UI_MENU'}
+        isMenuOpen={gameState === 'INTERACTION'}
       />
 
       {/* Wheelchair Pushing HUD Badge when holding */}
@@ -246,6 +249,8 @@ export const HUD: React.FC<HUDProps> = ({
             <span className="hidden sm:inline">リセット (R)</span>
           </button>
 
+          {GameConfig.debug.enabled && (
+            <>
           {/* Debug Mode Toggle (F3) */}
           <button
             onClick={() => game.toggleDebug()}
@@ -258,11 +263,13 @@ export const HUD: React.FC<HUDProps> = ({
             <Activity className="w-4 h-4" />
             <span>DEBUG (F3)</span>
           </button>
+            </>
+          )}
         </div>
       </div>
 
       {/* Center Left: Debug Telemetry Panel (When F3 enabled) */}
-      {isDebug && (
+      {GameConfig.debug.enabled && isDebug && (
         <div className="self-start mt-20 ml-72 bg-neutral-950/90 border border-neutral-700/80 rounded-xl p-3.5 backdrop-blur-md shadow-2xl text-xs flex flex-col gap-2 min-w-64 pointer-events-auto">
           <div className="flex items-center justify-between border-b border-neutral-800 pb-1.5 font-bold text-emerald-400 tracking-wider">
             <span>ENVIRONMENT DEBUG (F3)</span>
@@ -309,10 +316,21 @@ export const HUD: React.FC<HUDProps> = ({
             </div>
           </div>
 
+          <div className="bg-neutral-900/80 p-2.5 rounded-lg border border-neutral-800 grid grid-cols-2 gap-x-3 gap-y-1 font-mono text-[11px] text-neutral-200">
+            <span className="text-neutral-400">dt</span><span>{debugInfo.dtMs} ms</span>
+            <span className="text-neutral-400">state</span><span>{debugInfo.gameState}</span>
+            <span className="text-neutral-400">interaction</span><span>{debugInfo.interactionPhase}</span>
+            <span className="text-neutral-400">speed</span><span>{debugInfo.playerSpeed} m/s</span>
+            <span className="text-neutral-400">wheelchair</span><span>{debugInfo.wheelchairMode}</span>
+            <span className="text-neutral-400">phys bodies</span><span>{debugInfo.bodyCount}</span>
+          </div>
+
           <div className="text-[10px] text-neutral-400 pt-1 border-t border-neutral-800">
-            • Red wireframes: Collision obstacles (AABB)
+            • Red wireframes: static collision (AABB)
             <br />
-            • Color boxes: Room boundary volumes
+            • Cyan ring: player collider · Yellow/red rings: movable / braked bodies
+            <br />
+            • Pink lines: velocities + interaction ray
           </div>
         </div>
       )}

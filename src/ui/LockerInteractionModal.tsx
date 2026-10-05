@@ -5,7 +5,7 @@
  * Supports keyboard [E] and mobile tap interaction.
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { Game } from '../core/Game.ts';
 import { OutfitConfig, OUTFIT_PRESETS } from '../player/PlayerAvatar.ts';
 import { Shirt, Check, X, Sparkles, UserCheck, ShieldCheck } from 'lucide-react';
@@ -26,31 +26,6 @@ export const LockerInteractionModal: React.FC<LockerInteractionModalProps> = ({
   currentOutfit,
 }) => {
   const [justChanged, setJustChanged] = useState<string | null>(null);
-
-  // Ensure pointer lock is released when modal is open
-  useEffect(() => {
-    if (isModalOpen) {
-      if (document.pointerLockElement) {
-        document.exitPointerLock?.();
-      }
-    }
-  }, [isModalOpen]);
-
-  // Esc key closes modal
-  useEffect(() => {
-    if (!isModalOpen) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.code === 'Escape') {
-        e.preventDefault();
-        e.stopPropagation();
-        game.closeOutfitMenu(false);
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown, true);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown, true);
-    };
-  }, [isModalOpen, game]);
 
   const handleSelectOutfit = (outfitId: string) => {
     game.changeOutfit(outfitId);

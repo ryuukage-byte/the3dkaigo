@@ -1,13 +1,23 @@
 /**
  * PlayerController.ts
- * Third-person player controller supporting PC keyboard/mouse and tablet touch controls.
- * Features smooth movement, collision sliding, camera orbit, and wall-collision prevention.
+ * First/third-person player: look, movement, jump, camera.
+ *
+ * Responsibilities are split by when they run:
+ *   applyLook(dt)   once per frame   mouse/touch look, applied immediately (no smoothing = no latency)
+ *   simulate(dt)    per sub-step     acceleration, collision-resolved movement, gravity
+ *   animate(dt)     once per frame   avatar facing + walk cycle
+ *   updateCamera(dt) once per frame  after physics, so the camera never lags the body
+ *
+ * The logical collider is a circle (radius) in XZ with a height; the visible
+ * avatar mesh is only a follower of `position`.
  */
 
 import * as THREE from 'three';
 import { PlayerAvatar } from './PlayerAvatar.ts';
 import { collisionWorld } from '../world/CollisionWorld.ts';
 import { GameConfig } from '../core/GameConfig.ts';
+import { InputManager } from '../core/InputManager.ts';
+import { PlayerProxy } from '../physics/PhysicsWorld.ts';
 
 export interface TouchInputState {
   moveX: number; // -1 to 1
@@ -17,344 +27,250 @@ export interface TouchInputState {
   isRunning: boolean;
 }
 
-export class PlayerController {
-  public readonly position: THREE.Vector3 = new THREE.Vector3();
-  public readonly avatar: PlayerAvatar = new PlayerAvatar();
+export class PlayerController implements PlayerProxy {
+  public readonly position = new THREE.Vector3();
+  public readonly velocity = new THREE.Vector3();
+  public readonly avatar = new PlayerAvatar();
 
-  private camera: THREE.PerspectiveCamera;
-  private domElement: HTMLElement;
+  // PlayerProxy (physics view of the player)
+  public readonly radius = GameConfig.player.radius;
+  public readonly height = GameConfig.player.height;
+  public readonly mass = GameConfig.player.mass;
 
-  // Rotation & orientation
-  private yaw: number = 0; // horizontal rotation
-  private pitch: number = 0.25; // vertical rotation
-  private currentYaw: number = 0;
-  private currentPitch: number = 0.25;
+  public yaw = 0;
+  public pitch = 0.22;
 
-  // Camera settings
   public viewMode: 'firstPerson' | 'thirdPerson' = GameConfig.player.defaultViewMode;
-  public cameraDistance: number = GameConfig.camera.defaultDistance;
-  public cameraHeight: number = GameConfig.camera.defaultHeight;
+  public cameraDistance = GameConfig.camera.defaultDistance;
 
-  // Velocity & physics
-  public velocity: THREE.Vector3 = new THREE.Vector3();
-  private isGrounded: boolean = true;
-  public currentSpeed: number = 0;
+  /** Movement/look allowed this frame (set by Game from the state machine). */
+  public movementEnabled = true;
+  public lookEnabled = true;
+  /** Multiplier on walk/run speed (e.g. while pushing a wheelchair). */
+  public speedScale = 1;
+  public jumpEnabled = true;
 
-  // Input states & controls lock
-  public enabled: boolean = true;
-  private keys: { [key: string]: boolean } = {};
-  public isPointerLocked: boolean = false;
-  private isMouseDown: boolean = false;
+  public touchInput: TouchInputState = { moveX: 0, moveY: 0, lookX: 0, lookY: 0, isRunning: false };
 
-  // External touch controls for tablets
-  public touchInput: TouchInputState = {
-    moveX: 0,
-    moveY: 0,
-    lookX: 0,
-    lookY: 0,
-    isRunning: false,
-  };
+  public currentSpeed = 0;
+  private isGrounded = true;
+  private camDistance = GameConfig.camera.defaultDistance; // collision-adjusted 3P boom length
 
-  // Event callbacks
-  public onDebugToggle?: () => void;
+  // scratch (no per-frame allocation)
+  private readonly look = { x: 0, y: 0 };
+  private readonly wish = new THREE.Vector3();
+  private readonly fwd = new THREE.Vector3();
+  private readonly right = new THREE.Vector3();
+  private readonly camTarget = new THREE.Vector3();
+  private readonly camDir = new THREE.Vector3();
+  private readonly euler = new THREE.Euler(0, 0, 0, 'YXZ');
 
-  constructor(camera: THREE.PerspectiveCamera, domElement: HTMLElement) {
-    this.camera = camera;
-    this.domElement = domElement;
-
+  constructor(
+    private readonly camera: THREE.PerspectiveCamera,
+    private readonly input: InputManager
+  ) {
     this.resetPosition();
-    this.setupEventListeners();
   }
 
-  public resetPosition(customPos?: { x: number, y: number, z: number }) {
+  public resetPosition(customPos?: { x: number; y: number; z: number }) {
     const sp = customPos ?? GameConfig.player.spawnPosition;
     this.position.set(sp.x, sp.y, sp.z);
-    this.avatar.mesh.position.copy(this.position);
     this.velocity.set(0, 0, 0);
     this.yaw = GameConfig.player.spawnRotation;
     this.pitch = 0.22;
+    this.isGrounded = true;
+    this.avatar.mesh.position.copy(this.position);
+    this.avatar.mesh.rotation.y = this.yaw - Math.PI;
+    this.camDistance = this.cameraDistance;
+    this.snapCamera();
   }
 
-  public disableControls() {
-    this.enabled = false;
-    this.keys = {};
-    this.isMouseDown = false;
-    this.touchInput.moveX = 0;
-    this.touchInput.moveY = 0;
-    this.touchInput.lookX = 0;
-    this.touchInput.lookY = 0;
-    if (document.pointerLockElement) {
-      document.exitPointerLock?.();
-    }
-  }
-
-  public enableControls(requestPointerLock: boolean = true) {
-    this.enabled = true;
-    this.keys = {};
-    this.isMouseDown = false;
-    if (requestPointerLock && !this.isPointerLocked) {
-      this.domElement.requestPointerLock?.();
-    }
-  }
-
-  private setupEventListeners() {
-    window.addEventListener('keydown', (e) => {
-      if (!this.enabled) return;
-
-      this.keys[e.code] = true;
-
-      if (e.code === 'KeyR') {
-        this.resetPosition();
-      }
-
-      if (e.code === 'KeyV') {
-        this.toggleViewMode();
-      }
-
-      if (e.code === 'F3') {
-        e.preventDefault();
-        this.onDebugToggle?.();
-      }
-
-      if (e.code === 'Space' && this.isGrounded) {
-        this.velocity.y = GameConfig.player.jumpVelocity;
-        this.isGrounded = false;
-      }
-    });
-
-    window.addEventListener('keyup', (e) => {
-      if (!this.enabled) {
-        this.keys = {};
-        return;
-      }
-      this.keys[e.code] = false;
-    });
-
-    // Pointer lock for immersive desktop play
-    this.domElement.addEventListener('click', () => {
-      if (!this.enabled) return;
-      if (!this.isPointerLocked) {
-        this.domElement.requestPointerLock?.();
-      }
-    });
-
-    document.addEventListener('pointerlockchange', () => {
-      this.isPointerLocked = document.pointerLockElement === this.domElement;
-    });
-
-    this.domElement.addEventListener('mousedown', (e) => {
-      if (!this.enabled) return;
-      if (e.button === 0 || e.button === 2) {
-        this.isMouseDown = true;
-      }
-    });
-
-    window.addEventListener('mouseup', () => {
-      this.isMouseDown = false;
-    });
-
-    window.addEventListener('mousemove', (e) => {
-      if (!this.enabled) return;
-      if (this.isPointerLocked || this.isMouseDown) {
-        const sens = GameConfig.camera.sensitivity;
-        this.yaw -= e.movementX * sens;
-        this.pitch -= e.movementY * sens;
-        this.clampPitch();
-      }
-    });
-
-    // Mouse wheel camera distance zoom
-    this.domElement.addEventListener('wheel', (e) => {
-      e.preventDefault();
-      this.cameraDistance = THREE.MathUtils.clamp(
-        this.cameraDistance + e.deltaY * 0.003,
-        GameConfig.camera.minDistance,
-        GameConfig.camera.maxDistance
-      );
-    }, { passive: false });
+  public getYaw(): number {
+    return this.yaw;
   }
 
   public toggleViewMode(): 'firstPerson' | 'thirdPerson' {
-    this.viewMode = this.viewMode === 'firstPerson' ? 'thirdPerson' : 'firstPerson';
+    this.setViewMode(this.viewMode === 'firstPerson' ? 'thirdPerson' : 'firstPerson');
     return this.viewMode;
   }
 
   public setViewMode(mode: 'firstPerson' | 'thirdPerson') {
     this.viewMode = mode;
-  }
-
-  public getYaw(): number {
-    return this.currentYaw;
+    this.clampPitch();
   }
 
   private clampPitch() {
-    if (this.viewMode === 'firstPerson') {
-      // First person view can pitch up and down comfortably to inspect care beds, floor, ceiling
-      this.pitch = THREE.MathUtils.clamp(this.pitch, -Math.PI * 0.42, Math.PI * 0.42);
-    } else {
-      // Third person camera pitch limits
-      this.pitch = THREE.MathUtils.clamp(this.pitch, -0.2, 0.75);
-    }
+    this.pitch =
+      this.viewMode === 'firstPerson'
+        ? THREE.MathUtils.clamp(this.pitch, -Math.PI * 0.42, Math.PI * 0.42)
+        : THREE.MathUtils.clamp(this.pitch, -0.2, 0.75);
   }
 
-  public update(delta: number) {
-    // If controls are disabled (e.g. INTERACTION_MENU open), freeze movement & look
-    if (!this.enabled) {
-      this.currentSpeed = 0;
-      this.avatar.updateAnimation(0, delta);
-      this.updateCamera();
+  // ---- per frame: look ------------------------------------------------------
+
+  public applyLook() {
+    this.input.consumeLook(this.look);
+    const wheel = this.input.consumeWheel();
+    const touch = this.touchInput;
+
+    if (!this.lookEnabled) {
+      // drop whatever accumulated so it cannot snap the view when control returns
+      touch.lookX = 0;
+      touch.lookY = 0;
       return;
     }
 
-    // 1. Process touch look inputs (tablet)
-    if (this.touchInput.lookX !== 0 || this.touchInput.lookY !== 0) {
-      const sens = GameConfig.camera.sensitivity * 1.5;
-      this.yaw -= this.touchInput.lookX * sens;
-      this.pitch -= this.touchInput.lookY * sens;
-      this.clampPitch();
-      this.touchInput.lookX = 0;
-      this.touchInput.lookY = 0;
+    const sens = GameConfig.camera.sensitivity;
+    this.yaw -= this.look.x * sens;
+    this.pitch -= this.look.y * sens;
+    if (touch.lookX !== 0 || touch.lookY !== 0) {
+      this.yaw -= touch.lookX * sens * 1.5;
+      this.pitch -= touch.lookY * sens * 1.5;
+      touch.lookX = 0;
+      touch.lookY = 0;
     }
+    this.yaw = wrapAngle(this.yaw);
+    this.clampPitch();
 
-    // Smooth camera angles
-    this.currentYaw = THREE.MathUtils.lerp(this.currentYaw, this.yaw, 0.25);
-    this.currentPitch = THREE.MathUtils.lerp(this.currentPitch, this.pitch, 0.25);
+    if (wheel !== 0) {
+      this.cameraDistance = THREE.MathUtils.clamp(
+        this.cameraDistance + wheel * 0.003,
+        GameConfig.camera.minDistance,
+        GameConfig.camera.maxDistance
+      );
+    }
+  }
 
-    // 2. Compute movement intent vector
+  // ---- per sub-step: movement ----------------------------------------------
+
+  public simulate(dt: number) {
+    const cfg = GameConfig.player;
+
+    // 1. Movement intent from the (un-smoothed) yaw
     let forward = 0;
-    let right = 0;
-
-    // Keyboard W/A/S/D
-    if (this.keys['KeyW'] || this.keys['ArrowUp']) forward += 1;
-    if (this.keys['KeyS'] || this.keys['ArrowDown']) forward -= 1;
-    if (this.keys['KeyA'] || this.keys['ArrowLeft']) right -= 1;
-    if (this.keys['KeyD'] || this.keys['ArrowRight']) right += 1;
-
-    // Tablet Joystick
-    if (this.touchInput.moveY !== 0) forward -= this.touchInput.moveY; // joystick up is negative Y
-    if (this.touchInput.moveX !== 0) right += this.touchInput.moveX;
-
-    const isRunning = this.keys['ShiftLeft'] || this.keys['ShiftRight'] || this.touchInput.isRunning;
-    const baseSpeed = isRunning ? GameConfig.player.runSpeed : GameConfig.player.walkSpeed;
-
-    const moveDir = new THREE.Vector3();
-    if (forward !== 0 || right !== 0) {
-      // Relative to camera yaw
-      const forwardVec = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), this.currentYaw);
-      const rightVec = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), this.currentYaw);
-
-      moveDir.addScaledVector(forwardVec, forward);
-      moveDir.addScaledVector(rightVec, right);
-      moveDir.normalize();
-
-      // Rotate avatar to face direction of movement smoothly
-      const targetAngle = Math.atan2(moveDir.x, moveDir.z);
-      this.avatar.mesh.rotation.y = THREE.MathUtils.lerp(this.avatar.mesh.rotation.y, targetAngle, 0.2);
-      this.currentSpeed = baseSpeed;
-      this.velocity.x = moveDir.x * this.currentSpeed;
-      this.velocity.z = moveDir.z * this.currentSpeed;
-    } else {
-      this.currentSpeed = 0;
-      this.velocity.x = 0;
-      this.velocity.z = 0;
+    let strafe = 0;
+    let running = false;
+    if (this.movementEnabled) {
+      const inp = this.input;
+      if (inp.isKeyDown('KeyW') || inp.isKeyDown('ArrowUp')) forward += 1;
+      if (inp.isKeyDown('KeyS') || inp.isKeyDown('ArrowDown')) forward -= 1;
+      if (inp.isKeyDown('KeyA') || inp.isKeyDown('ArrowLeft')) strafe -= 1;
+      if (inp.isKeyDown('KeyD') || inp.isKeyDown('ArrowRight')) strafe += 1;
+      forward -= this.touchInput.moveY; // joystick up is negative Y
+      strafe += this.touchInput.moveX;
+      running = inp.isKeyDown('ShiftLeft') || inp.isKeyDown('ShiftRight') || this.touchInput.isRunning;
     }
 
-    // 3. Movement with Collision Resolution
-    const deltaMove = moveDir.clone().multiplyScalar(this.currentSpeed * delta);
-    const radius = GameConfig.player.radius;
+    this.fwd.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
+    this.right.set(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
+    this.wish.set(0, 0, 0).addScaledVector(this.fwd, forward).addScaledVector(this.right, strafe);
+    const wishLen = this.wish.length();
+    if (wishLen > 1) this.wish.divideScalar(wishLen); // diagonals never faster; analog stick keeps partial input
 
-    const resolvedPos = collisionWorld.resolveMovement(this.position, deltaMove, radius, GameConfig.player.height);
-    this.position.copy(resolvedPos);
+    const maxSpeed = (running ? cfg.runSpeed : cfg.walkSpeed) * this.speedScale;
+    const targetX = this.wish.x * maxSpeed;
+    const targetZ = this.wish.z * maxSpeed;
 
-    // Gravity / Jumping
+    // 2. Accelerate toward target velocity (dt-based, deterministic)
+    const rate = (wishLen > 0 ? cfg.acceleration : cfg.deceleration) * dt;
+    const dvx = targetX - this.velocity.x;
+    const dvz = targetZ - this.velocity.z;
+    const dv = Math.hypot(dvx, dvz);
+    if (dv <= rate) {
+      this.velocity.x = targetX;
+      this.velocity.z = targetZ;
+    } else {
+      this.velocity.x += (dvx / dv) * rate;
+      this.velocity.z += (dvz / dv) * rate;
+    }
+
+    // 3. Move with sliding collision. If something stopped us, velocity follows
+    //    the real displacement so it cannot build up against a wall.
+    const ox = this.position.x;
+    const oz = this.position.z;
+    const wantX = this.velocity.x * dt;
+    const wantZ = this.velocity.z * dt;
+    collisionWorld.moveCircle(this.position, wantX, wantZ, this.radius, this.height);
+    const mx = this.position.x - ox;
+    const mz = this.position.z - oz;
+    if (Math.hypot(mx, mz) < Math.hypot(wantX, wantZ) * 0.999) {
+      this.velocity.x = mx / dt;
+      this.velocity.z = mz / dt;
+    }
+    this.currentSpeed = Math.hypot(this.velocity.x, this.velocity.z);
+
+    // 4. Jump / gravity
+    if (this.movementEnabled && this.isGrounded && this.jumpEnabled && this.input.wasPressed('Space')) {
+      this.velocity.y = cfg.jumpVelocity;
+      this.isGrounded = false;
+    }
     if (!this.isGrounded) {
-      this.velocity.y -= 15.0 * delta;
-      this.position.y += this.velocity.y * delta;
+      this.velocity.y -= cfg.gravity * dt;
+      this.position.y += this.velocity.y * dt;
       if (this.position.y <= 0) {
         this.position.y = 0;
         this.velocity.y = 0;
         this.isGrounded = true;
       }
     }
-
-    // Update avatar mesh position and walking cycle
-    this.avatar.mesh.position.copy(this.position);
-    this.avatar.updateAnimation(this.currentSpeed, delta);
-
-    // 4. Update Third-Person Camera
-    this.updateCamera();
   }
 
-  public setLookOrientation(yaw: number, pitch: number = 0.22) {
-    this.yaw = yaw;
-    this.currentYaw = yaw;
-    this.pitch = pitch;
-    this.currentPitch = pitch;
-    this.clampPitch();
-    this.updateCamera();
-  }
+  // ---- per frame: avatar + camera ----------------------------------------------
 
-  private updateCamera() {
-    if (this.viewMode === 'firstPerson') {
-      // First Person View: Camera is positioned at caregiver eye level
-      this.avatar.setFirstPersonVisibility(this.avatar.isHoldingWheelchair);
-
-      const eyeHeight = GameConfig.player.eyeHeight;
-      const eyePos = this.position.clone().add(new THREE.Vector3(0, eyeHeight, 0));
-      this.camera.position.copy(eyePos);
-
-      // Compute look forward direction based on currentYaw and currentPitch
-      const cosPitch = Math.cos(this.currentPitch);
-      const sinPitch = Math.sin(this.currentPitch);
-      const sinYaw = Math.sin(this.currentYaw);
-      const cosYaw = Math.cos(this.currentYaw);
-
-      // Look direction vector: yaw 0 is looking towards negative Z (North/South)
-      const lookDir = new THREE.Vector3(
-        -sinYaw * cosPitch,
-        sinPitch,
-        -cosYaw * cosPitch
-      );
-
-      const lookTarget = eyePos.clone().add(lookDir);
-      this.camera.lookAt(lookTarget);
-    } else {
-      // Third Person View
-      this.avatar.setThirdPersonVisibility();
-
-      const target = this.position.clone().add(new THREE.Vector3(0, 1.4, 0)); // look at caregiver upper torso/head
-
-      // Compute ideal camera position in spherical coordinates relative to target
-      const cosPitch = Math.cos(this.currentPitch);
-      const sinPitch = Math.sin(this.currentPitch);
-      const sinYaw = Math.sin(this.currentYaw);
-      const cosYaw = Math.cos(this.currentYaw);
-
-      let dist = this.cameraDistance;
-
-      // Check collision along camera ray to prevent outside wall clipping
-      const rayDir = new THREE.Vector3(sinYaw * cosPitch, sinPitch, cosYaw * cosPitch).normalize();
-      const desiredCamPos = target.clone().add(rayDir.clone().multiplyScalar(dist));
-
-      // Collision check: if desiredCamPos intersects obstacle or building ceiling, clamp distance
-      let clampedCamPos = desiredCamPos;
-      const testSteps = 10;
-      for (let step = 1; step <= testSteps; step++) {
-        const t = step / testSteps;
-        const testPos = target.clone().add(rayDir.clone().multiplyScalar(dist * t));
-        if (testPos.y >= GameConfig.facility.ceilingHeight - 0.15) {
-          testPos.y = GameConfig.facility.ceilingHeight - 0.15;
-        }
-        if (collisionWorld.checkCollision(testPos, 0.25, 0.4)) {
-          // Step back slightly from collision point
-          const safeDist = Math.max(GameConfig.camera.minDistance, dist * ((step - 1) / testSteps));
-          clampedCamPos = target.clone().add(rayDir.clone().multiplyScalar(safeDist));
-          break;
-        }
-      }
-
-      this.camera.position.lerp(clampedCamPos, 0.35);
-      this.camera.lookAt(target);
+  public animate(dt: number, holdingWheelchair: boolean) {
+    // Face movement direction (or the look direction while holding a wheelchair)
+    let targetAngle: number | null = null;
+    if (holdingWheelchair) {
+      targetAngle = this.yaw - Math.PI;
+    } else if (this.currentSpeed > 0.1) {
+      targetAngle = Math.atan2(this.velocity.x, this.velocity.z);
     }
+    if (targetAngle !== null) {
+      const cur = this.avatar.mesh.rotation.y;
+      const diff = wrapAngle(targetAngle - cur);
+      this.avatar.mesh.rotation.y = cur + diff * (1 - Math.exp(-GameConfig.player.turnSpeed * dt));
+    }
+
+    this.avatar.mesh.position.copy(this.position);
+    this.avatar.updateAnimation(this.currentSpeed, dt);
   }
+
+  /** Snap the camera to its target with no smoothing (teleport / reset). */
+  private snapCamera() {
+    this.updateCamera(1);
+  }
+
+  public updateCamera(dt: number) {
+    if (this.viewMode === 'firstPerson') {
+      this.avatar.setFirstPersonVisibility(this.avatar.isHoldingWheelchair);
+      this.camera.position.set(this.position.x, this.position.y + GameConfig.player.eyeHeight, this.position.z);
+      this.euler.set(this.pitch, this.yaw, 0);
+      this.camera.quaternion.setFromEuler(this.euler);
+      return;
+    }
+
+    this.avatar.setThirdPersonVisibility();
+    this.camTarget.set(this.position.x, this.position.y + 1.4, this.position.z);
+    const cosPitch = Math.cos(this.pitch);
+    this.camDir.set(Math.sin(this.yaw) * cosPitch, Math.sin(this.pitch), Math.cos(this.yaw) * cosPitch);
+
+    // Free distance along the boom: walls (ray vs static boxes) and the ceiling
+    const wanted = this.cameraDistance;
+    let free = collisionWorld.raycast(this.camTarget, this.camDir, wanted + 0.3) - 0.3;
+    if (this.camDir.y > 1e-4) {
+      free = Math.min(free, (GameConfig.facility.ceilingHeight - 0.15 - this.camTarget.y) / this.camDir.y);
+    }
+    free = THREE.MathUtils.clamp(free, 0.4, wanted);
+
+    // Pull in instantly (never see through a wall), ease back out
+    if (free < this.camDistance) this.camDistance = free;
+    else this.camDistance += (free - this.camDistance) * (1 - Math.exp(-8 * dt));
+
+    this.camera.position.copy(this.camTarget).addScaledVector(this.camDir, this.camDistance);
+    this.camera.lookAt(this.camTarget);
+  }
+}
+
+function wrapAngle(a: number): number {
+  return Math.atan2(Math.sin(a), Math.cos(a));
 }

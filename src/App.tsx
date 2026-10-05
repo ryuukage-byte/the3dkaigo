@@ -4,34 +4,16 @@
  */
 
 import React, { useEffect, useRef, useState } from 'react';
-import { Game, GameMode } from './core/Game.ts';
+import { Game, GameUIState } from './core/Game.ts';
 import { HUD } from './ui/HUD.tsx';
 import { TouchControls } from './ui/TouchControls.tsx';
-import { RoomDefinition } from './world/FacilityLayout.ts';
-import { OutfitConfig, OUTFIT_PRESETS } from './player/PlayerAvatar.ts';
-import { ActiveInteractionInfo } from './interaction/InteractionManager.ts';
+import { OUTFIT_PRESETS } from './player/PlayerAvatar.ts';
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const gameRef = useRef<Game | null>(null);
 
-  const [gameState, setGameState] = useState<{
-    fps: number;
-    triangles: number;
-    drawCalls: number;
-    playerPos: { x: number; y: number; z: number };
-    playerYaw: number;
-    viewMode: 'firstPerson' | 'thirdPerson';
-    currentRoom?: RoomDefinition;
-    isDebug: boolean;
-    isNearLocker: boolean;
-    isLockerOpen: boolean;
-    isChangingClothesModalOpen: boolean;
-    currentOutfit: OutfitConfig;
-    activeInteraction: ActiveInteractionInfo | null;
-    gameMode: GameMode;
-    isHoldingWheelchair: boolean;
-  }>({
+  const [gameState, setGameState] = useState<GameUIState>({
     fps: 60,
     triangles: 0,
     drawCalls: 0,
@@ -44,8 +26,13 @@ export default function App() {
     isChangingClothesModalOpen: false,
     currentOutfit: OUTFIT_PRESETS[0],
     activeInteraction: null,
-    gameMode: 'FPS',
+    gameState: 'GAMEPLAY',
     isHoldingWheelchair: false,
+    dtMs: 0,
+    playerSpeed: 0,
+    interactionPhase: 'IDLE',
+    wheelchairMode: '-',
+    bodyCount: 0,
   });
 
   const [isTouchDevice, setIsTouchDevice] = useState(false);
@@ -60,6 +47,7 @@ export default function App() {
     // Initialize 3D Game engine
     const game = new Game(canvasRef.current);
     gameRef.current = game;
+    if (import.meta.env.DEV) (window as unknown as { __game?: Game }).__game = game; // dev-only inspection hook
 
     game.onStateUpdate = (state) => {
       setGameState(state);
@@ -96,8 +84,9 @@ export default function App() {
           isChangingClothesModalOpen={gameState.isChangingClothesModalOpen}
           currentOutfit={gameState.currentOutfit}
           activeInteraction={gameState.activeInteraction}
-          gameMode={gameState.gameMode}
+          gameState={gameState.gameState}
           isHoldingWheelchair={gameState.isHoldingWheelchair}
+          debugInfo={gameState}
         />
       )}
 
