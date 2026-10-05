@@ -11,8 +11,11 @@
  *   correction split by inverse mass + a small restitution impulse, so a chair
  *   barely slows the player while a table noticeably does. A body that is blocked
  *   (wall, locked brake, chain of bodies) pushes the player back instead.
- * - A "grip joint" lets the player hold a body (wheelchair handles): two-way
- *   positional constraint with mass sharing; no teleporting.
+ * - A "grip" lets the player hold a body (wheelchair handles). It is a max-reach
+ *   rope plus normal contact: walking forward pushes the body through contact
+ *   (mass-weighted like any prop), walking back drags it through the rope.
+ *   The player is never moved to a fixed spot, so a blocked grip point cannot
+ *   leave the player stuck.
  *
  * step(dt) must be called with dt <= ~1/60 (Game sub-steps larger frames).
  */
@@ -118,17 +121,18 @@ export class PhysicalBody {
   }
 }
 
-/** Player <-> body grip. Anchor is `anchorDistance` behind the body (local -Z). */
+/** Player <-> body grip: the player may be at most `reach` (centre to centre) from the body. */
 interface PlayerJoint {
   body: PhysicalBody;
-  anchorDistance: number;
-  slack: number;
-  engaged: boolean; // false while the player is still being walked to the grip
+  reach: number;
   alignYaw: boolean;
 }
 
-const JOINT_ASSIST_SPEED = 2.2; // m/s the player is drawn to the grips before engagement
 const JOINT_YAW_RATE = 2.8; // rad/s max body turn toward player's facing
+const GRIP_LANE_HALF_WIDTH = 0.32; // m: hands on the handles keep the caregiver within this of the chair's axis
+const GRIP_MIN_BEHIND = 0.5; // m behind the chair centre at least (contact keeps ~0.66 anyway)
+const LANE_MAX_SPEED = 3.0; // m/s the caregiver is slid into the rear lane (gentle, never a snap)
+const ROPE_MAX_SPEED = 6.0; // m/s cap on rope correction: never snaps, still above run speed
 
 export class PhysicsWorld {
   private bodies = new Map<string, PhysicalBody>();
@@ -139,7 +143,6 @@ export class PhysicsWorld {
 
   // scratch
   private readonly tmp = new THREE.Vector3();
-  private readonly anchor = new THREE.Vector3();
 
   public register(config: PhysicalBodyConfig): PhysicalBody {
     let id = config.id;
@@ -182,8 +185,8 @@ export class PhysicsWorld {
     return this.joint?.body ?? null;
   }
 
-  public attachPlayerJoint(body: PhysicalBody, anchorDistance: number, alignYaw: boolean = true) {
-    this.joint = { body, anchorDistance, slack: 0.04, engaged: false, alignYaw };
+  public attachPlayerJoint(body: PhysicalBody, reach: number, alignYaw: boolean = true) {
+    this.joint = { body, reach, alignYaw };
   }
 
   public detachPlayerJoint() {
@@ -204,20 +207,11 @@ export class PhysicsWorld {
 
     this.pushLoad = 0;
     this.alignHeldBody(dt);
-    const startPos = this.joint ? this.joint.body.position.clone() : null;
-
     for (let it = 0; it < SOLVER_ITERATIONS; it++) {
       this.solveJoint(dt);
       this.solvePlayerContacts(dt, it === 0);
       this.solveBodyContacts();
       this.constrainToStatics();
-    }
-
-    // Held body keeps the momentum it actually had, so releasing it rolls on.
-    if (this.joint?.engaged && startPos && !this.joint.body.locked) {
-      const b = this.joint.body;
-      b.velocity.set((b.position.x - startPos.x) / dt, 0, (b.position.z - startPos.z) / dt);
-      b.clampSpeed();
     }
 
     this.finalizePlayer();
@@ -279,68 +273,86 @@ export class PhysicsWorld {
 
   // ---- constraints -------------------------------------------------------
 
-  /** Turns the held body toward the player's facing at a capped rate (never snaps). Once per step. */
+  /**
+   * Turns the held body toward the player's facing at a capped rate (never snaps). Once per step.
+   * The body swings on an arc around the player (like steering a chair you are holding), not
+   * about its own centre, so the caregiver stays behind it through a turn. The solver then
+   * pushes it out of anything the arc sweeps into.
+   */
   private alignHeldBody(dt: number) {
     const j = this.joint;
     const p = this.player;
-    if (!j || !p || !j.alignYaw || !j.engaged) return;
+    if (!j || !p || !j.alignYaw) return;
     const b = j.body;
     if (b.locked) return;
     let err = p.yaw - Math.PI - b.rotationY;
     err = Math.atan2(Math.sin(err), Math.cos(err));
     const turn = THREE.MathUtils.clamp(err * 6, -JOINT_YAW_RATE, JOINT_YAW_RATE) * dt;
-    b.rotationY += Math.abs(turn) > Math.abs(err) ? err : turn;
+    const delta = Math.abs(turn) > Math.abs(err) ? err : turn;
+    b.rotationY += delta;
     b.angularVelocity = 0;
+
+    const rx = b.position.x - p.position.x;
+    const rz = b.position.z - p.position.z;
+    const c = Math.cos(delta);
+    const s = Math.sin(delta);
+    b.position.x = p.position.x + rx * c + rz * s;
+    b.position.z = p.position.z - rx * s + rz * c;
   }
 
+  /**
+   * Grip: keeps the caregiver within arm's reach (rope, mass-shared so pulling away drags the
+   * body) and in the rear lane behind the handles (player-only correction: steering is done by
+   * turning, not by sidestepping). Corrections are rate-capped so nothing ever snaps.
+   */
   private solveJoint(dt: number) {
     const j = this.joint;
     const p = this.player;
     if (!j || !p) return;
     const b = j.body;
+    const cap = (ROPE_MAX_SPEED * dt) / SOLVER_ITERATIONS;
 
-    this.anchor.set(
-      b.position.x - Math.sin(b.rotationY) * j.anchorDistance,
-      0,
-      b.position.z - Math.cos(b.rotationY) * j.anchorDistance
-    );
-    let ex = this.anchor.x - p.position.x;
-    let ez = this.anchor.z - p.position.z;
+    // Rope
+    let ex = b.position.x - p.position.x;
+    let ez = b.position.z - p.position.z;
     const dist = Math.hypot(ex, ez);
-
-    if (!j.engaged) {
-      // Walk the player to the grips at a capped speed (the grab is not a teleport);
-      // the joint engages exactly on arrival so there is never a final snap.
-      const move = Math.min(dist, (JOINT_ASSIST_SPEED * dt) / SOLVER_ITERATIONS);
-      if (dist > 1e-6) {
-        p.position.x += (ex / dist) * move;
-        p.position.z += (ez / dist) * move;
-      }
-      if (move >= dist - 1e-6) j.engaged = true;
-      return;
+    if (dist > j.reach) {
+      const excess = Math.min(dist - j.reach, cap);
+      ex = (ex / dist) * excess;
+      ez = (ez / dist) * excess;
+      const invP = 1 / p.mass;
+      const invB = b.locked ? 0 : 1 / b.mass;
+      const inv = invP + invB;
+      p.position.x += ex * (invP / inv);
+      p.position.z += ez * (invP / inv);
+      b.position.x -= ex * (invB / inv);
+      b.position.z -= ez * (invB / inv);
     }
 
-    if (dist <= j.slack) return;
-    const excess = dist - j.slack;
-    ex = (ex / dist) * excess;
-    ez = (ez / dist) * excess;
+    const laneCap = (LANE_MAX_SPEED * dt) / SOLVER_ITERATIONS;
 
-    const invP = 1 / p.mass;
-    const invB = b.locked ? 0 : 1 / b.mass;
-    const inv = invP + invB;
-    p.position.x += ex * (invP / inv);
-    p.position.z += ez * (invP / inv);
-    b.position.x -= ex * (invB / inv);
-    b.position.z -= ez * (invB / inv);
+    // Rear lane, in the body's local frame (forward = (sin r, cos r), right = (cos r, -sin r))
+    const fx = Math.sin(b.rotationY);
+    const fz = Math.cos(b.rotationY);
+    const dx = p.position.x - b.position.x;
+    const dz = p.position.z - b.position.z;
+    const lateral = dx * fz - dz * fx; // along right = (fz, -fx)
+    const along = dx * fx + dz * fz; // negative = behind
+    let moveLat = 0;
+    if (Math.abs(lateral) > GRIP_LANE_HALF_WIDTH) {
+      moveLat = -Math.sign(lateral) * Math.min(Math.abs(lateral) - GRIP_LANE_HALF_WIDTH, laneCap);
+    }
+    let moveBack = 0;
+    if (along > -GRIP_MIN_BEHIND) moveBack = -Math.min(along + GRIP_MIN_BEHIND, laneCap);
+    p.position.x += fz * moveLat + fx * moveBack;
+    p.position.z += -fx * moveLat + fz * moveBack;
   }
 
   private solvePlayerContacts(dt: number, applyImpulses: boolean) {
     const p = this.player;
     if (!p) return;
-    const heldBody = this.joint?.body ?? null;
 
     for (const b of this.list) {
-      if (b === heldBody) continue;
       if (p.position.y + 0.1 > b.height) continue; // jumping over it
 
       const dx = b.position.x - p.position.x;
@@ -455,9 +467,8 @@ export class PhysicsWorld {
   private finalizePlayer() {
     const p = this.player;
     if (!p) return;
-    const heldBody = this.joint?.body ?? null;
     for (const b of this.list) {
-      if (b === heldBody || p.position.y + 0.1 > b.height) continue;
+      if (p.position.y + 0.1 > b.height) continue;
       const dx = p.position.x - b.position.x;
       const dz = p.position.z - b.position.z;
       const minDist = p.radius + b.radius;

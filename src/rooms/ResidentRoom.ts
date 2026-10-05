@@ -43,10 +43,10 @@ export function createResidentRoom(config: ResidentRoomConfig): THREE.Group {
     });
     group.add(bed);
 
-    // Wheelchair placed beside bed on transfer side (clear 1.0m transfer zone)
+    // Wheelchair parked on the transfer side with a clear lane behind (caregiver) and ahead (to the door)
     const wheelchair = createWheelchair({
-      position: new THREE.Vector3(c.x - 0.75, 0, c.z - 0.2),
-      rotationY: Math.PI / 2, // facing bed
+      position: new THREE.Vector3(c.x - 0.65, 0, c.z - 0.2),
+      rotationY: Math.PI, // facing the corridor door
       name: 'wheelchair_room01',
       interactionManager: mgr,
       onToggleHold: config.onToggleHold,
@@ -112,10 +112,10 @@ export function createResidentRoom(config: ResidentRoomConfig): THREE.Group {
     });
     group.add(bed);
 
-    // Wheelchair placed on North side of bed
+    // Wheelchair parked beside the bed with a clear lane behind it for the caregiver
     const wheelchair = createWheelchair({
-      position: new THREE.Vector3(c.x - 0.2, 0, c.z - 0.6),
-      rotationY: Math.PI,
+      position: new THREE.Vector3(c.x + 0.2, 0, c.z - 0.6),
+      rotationY: Math.PI / 2,
       name: 'wheelchair_room02',
       interactionManager: mgr,
       onToggleHold: config.onToggleHold,
@@ -161,9 +161,10 @@ export function createResidentRoom(config: ResidentRoomConfig): THREE.Group {
 
   } else {
     // Room 03: Slightly more constrained realistic navigation challenge
-    // Bed tucked closer to wall, narrower approach clearance for wheelchair navigation
+    // Bed tucked closer to the west wall: its east edge stays clear of the door's span so a
+    // wheelchair can still be steered out (it needs ~0.1 m of slack either side of the 0.95 m door)
     const bed = createCareBed({
-      position: new THREE.Vector3(c.x - 0.7, 0, c.z - 0.3),
+      position: new THREE.Vector3(c.x - 0.85, 0, c.z - 0.3),
       rotationY: 0,
       railSide: 'both', // rails on both sides
       name: 'bed_room03',
@@ -171,10 +172,10 @@ export function createResidentRoom(config: ResidentRoomConfig): THREE.Group {
     });
     group.add(bed);
 
-    // Wheelchair parked at foot of bed with tighter turning radius
+    // Wheelchair parked at foot of bed with a clear lane behind and ahead
     const wheelchair = createWheelchair({
-      position: new THREE.Vector3(c.x + 0.65, 0, c.z + 0.6),
-      rotationY: -Math.PI / 4,
+      position: new THREE.Vector3(c.x + 0.65, 0, c.z + 0.2),
+      rotationY: 0,
       name: 'wheelchair_room03',
       interactionManager: mgr,
       onToggleHold: config.onToggleHold,
@@ -183,7 +184,7 @@ export function createResidentRoom(config: ResidentRoomConfig): THREE.Group {
 
     // Bedside unit
     const bedside = createTable({
-      position: new THREE.Vector3(c.x - 0.7, 0, c.z - 1.45),
+      position: new THREE.Vector3(c.x - 0.85, 0, c.z - 1.45),
       type: 'bedside',
       name: 'bedside_room03',
     });
