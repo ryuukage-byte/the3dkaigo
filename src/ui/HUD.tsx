@@ -91,7 +91,11 @@ export const HUD: React.FC<HUDProps> = ({
         <div className="absolute bottom-20 left-1/2 -translate-x-1/2 pointer-events-auto">
           <div className="flex items-center gap-2 px-4 py-2 rounded-xl bg-neutral-900/90 border border-sky-400/80 shadow-2xl backdrop-blur-md text-white text-xs font-semibold animate-in fade-in">
             <span className="w-2 h-2 rounded-full bg-sky-400 animate-ping" />
-            <span>Sedang Memegang Kursi Roda</span>
+            <span>
+              {debugInfo.wheelchairBraked
+                ? 'Rem terkunci: lepas rem (tuas merah) lalu dorong dengan W'
+                : 'Sedang Memegang Kursi Roda: dorong dengan W'}
+            </span>
             <button
               onClick={() => {
                 if (game.heldWheelchair) game.heldWheelchair.toggleHold();

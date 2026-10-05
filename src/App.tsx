@@ -28,6 +28,7 @@ export default function App() {
     activeInteraction: null,
     gameState: 'GAMEPLAY',
     isHoldingWheelchair: false,
+    wheelchairBraked: false,
     dtMs: 0,
     playerSpeed: 0,
     interactionPhase: 'IDLE',

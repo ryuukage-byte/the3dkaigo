@@ -272,6 +272,15 @@ export class InteractionManager {
     return target;
   }
 
+  public get coolingDown(): boolean {
+    return this.cooldown > 0;
+  }
+
+  /** For interactions executed outside tryInteract (Game's hold-release shortcut). */
+  public startCooldown() {
+    this.cooldown = GameConfig.interaction.cooldown;
+  }
+
   /** A UI interaction took over: stop raycasting, remember what to exit. */
   public beginEngagement(target: InteractionTarget | null) {
     this.clearActiveTarget();

@@ -44,6 +44,7 @@ export interface GameUIState {
   activeInteraction: ActiveInteractionInfo | null;
   gameState: GameState;
   isHoldingWheelchair: boolean;
+  wheelchairBraked: boolean;
   // debug telemetry (only meaningful when isDebug)
   dtMs: number;
   playerSpeed: number;
@@ -225,6 +226,15 @@ export class Game {
     if (!this.fsm.rules.interaction) return;
     const im = this.sceneManager.interactionManager;
 
+    // Holding a wheelchair: E releases it wherever the crosshair is. The one exception is the
+    // brake lever, so the caregiver can still release the brake without letting go.
+    if (this.heldWheelchair && im.activeTarget?.action !== 'brake') {
+      if (im.coolingDown) return;
+      im.startCooldown();
+      this.heldWheelchair.toggleHold();
+      return;
+    }
+
     const target = im.tryInteract();
     if (!target) {
       if (this.isNearLocker && im.phase !== 'ENGAGED') this.openOutfitMenu();
@@ -249,12 +259,8 @@ export class Game {
         this.heldWheelchair.toggleHold(); // release the previous one (re-enters with isHolding=false)
       }
       this.heldWheelchair = wheelchair;
-      // The player is walked to the grips by the physics joint, never teleported
-      physicsWorld.attachPlayerJoint(
-        wheelchair.physicalBody,
-        wheelchair.collisionRadius + this.player.radius + 0.04,
-        true
-      );
+      // Contact pushes it, the rope drags it; the player is never moved to a fixed spot
+      physicsWorld.attachPlayerJoint(wheelchair.physicalBody, wheelchair.gripReach, true);
       this.player.avatar.isHoldingWheelchair = true;
     } else {
       if (this.heldWheelchair === wheelchair) {
@@ -344,6 +350,7 @@ export class Game {
       a ? `${a.targetId}|${a.label}|${a.stateText ?? ''}` : '-',
       this.isNearLocker ? 1 : 0,
       this.heldWheelchair ? 1 : 0,
+      this.heldWheelchair?.state.brakeLocked ? 1 : 0,
       this.player.viewMode,
       this.sceneManager.debug.isEnabled ? 1 : 0,
       room?.id ?? '',
@@ -374,6 +381,7 @@ export class Game {
       activeInteraction: a,
       gameState: this.fsm.state,
       isHoldingWheelchair: this.heldWheelchair !== null,
+      wheelchairBraked: this.heldWheelchair?.state.brakeLocked ?? false,
       dtMs: Number((this.frameDt * 1000).toFixed(1)),
       playerSpeed: Number(this.player.currentSpeed.toFixed(2)),
       interactionPhase: im.phase,

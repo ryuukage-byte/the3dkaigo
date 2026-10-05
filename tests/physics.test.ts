@@ -95,32 +95,68 @@ reset(); { let braked = true; const p = mkPlayer(0, 2); physicsWorld.setPlayer(p
   let travelled = 0, last = w.position.z; walk(p, 0, 0, 0, 4, 1 / 60, () => { travelled += Math.abs(w.position.z - last); last = w.position.z; });
   ok(z1 < 0.8 - 0.3, `unbraked wheelchair pushed z=${z1.toFixed(2)}`);
   ok(Math.hypot(w.velocity.x, w.velocity.z) === 0 && travelled > 0.05, `coasts ${travelled.toFixed(2)}m after release (v0=${speedAtRelease.toFixed(2)}) then stops`); }
-// 9. grip joint: grab from 1.5m away, no teleport, push toward wall, stops w/o overlap, chair yaw follows
-reset(); { const p = mkPlayer(0, 3); physicsWorld.setPlayer(p);
-  const w = body('wc', 0, 1, { mass: 24, radius: 0.42, height: 0.95, friction: 0.12, linearDamping: 0.25, lateralGrip: 6 });
-  w.rotationY = Math.PI; w.group.rotation.y = Math.PI; // faces -Z? forward=(sin,cos)=(0,-1)
-  p.yaw = 0; // looking -Z; chair target yaw = yaw - PI = -PI
-  physicsWorld.attachPlayerJoint(w, 0.42 + 0.32 + 0.04, true);
-  const maxStep = walk(p, 0, 0, 0, 1.0, 1 / 60);
-  const d = Math.hypot(p.position.x - w.position.x, p.position.z - w.position.z);
-  ok(maxStep < 2.4 / 60 + 1e-3, `grab is smooth: max per-step player move ${maxStep.toFixed(4)}m`);
-  ok(Math.abs(d - 0.78) < 0.08, `player reached grips d=${d.toFixed(2)}`);
-  let bad = 0, maxJump = 0, lastW = w.position.clone();
-  walk(p, 0, -1, 1.68, 6, 1 / 60, () => {
-    maxJump = Math.max(maxJump, w.position.distanceTo(lastW)); lastW.copy(w.position);
-    if (w.position.z < -5 + 0.42 - 1e-3) bad++;
-    if (Math.hypot(p.position.x - w.position.x, p.position.z - w.position.z) > 0.78 + 0.12) bad++;
-  });
-  ok(bad === 0 && maxJump < 0.04, `held wheelchair pushed into wall: violations=${bad} maxStep=${maxJump.toFixed(3)} wcZ=${w.position.z.toFixed(2)} pZ=${p.position.z.toFixed(2)}`);
-  // pull it back out (reverse)
-  walk(p, 0, 1, 1.68, 2, 1 / 60);
-  ok(w.position.z > -4.4, `reverse pulls it away from wall wcZ=${w.position.z.toFixed(2)}`); }
-// 10. brake on while held: player cannot drag it
-reset(); { let braked = false; const p = mkPlayer(0, 3); physicsWorld.setPlayer(p);
-  const w = body('wc', 0, 1, { mass: 24, radius: 0.42, height: 0.95, friction: 0.12, linearDamping: 0.25, lateralGrip: 6, isLocked: () => braked });
-  w.rotationY = Math.PI; w.group.rotation.y = Math.PI;
-  physicsWorld.attachPlayerJoint(w, 0.78, true); walk(p, 0, 0, 0, 1, 1 / 60);
-  braked = true; const z0 = w.position.z; walk(p, 0, 1, 1.68, 1.5, 1 / 60);
-  ok(w.position.z === z0 && Math.hypot(p.position.x - w.position.x, p.position.z - w.position.z) < 0.78 + 0.1, 'braked+held: caregiver cannot drag chair away'); }
+// 9. REGRESSION: grab wheelchair -> press W -> wheelchair displacement > 0 (brake off), player moves with it
+const wcOpts = { mass: 24, radius: 0.34, height: 0.95, friction: 0.12, linearDamping: 0.25, lateralGrip: 6 };
+function wheelchairScene(braked: boolean, playerDist = 0.9) {
+  reset(); const p = mkPlayer(0, 1 + playerDist); physicsWorld.setPlayer(p);
+  const state = { braked };
+  const w = body('wc', 0, 1, { ...wcOpts, isLocked: () => state.braked });
+  w.rotationY = Math.PI; w.group.rotation.y = Math.PI; // faces -Z; handles at +Z
+  p.yaw = 0;
+  physicsWorld.attachPlayerJoint(w, 1.15, true);
+  return { p, w, state };
+}
+{ const { p, w } = wheelchairScene(false);
+  const z0 = w.position.z, pz0 = p.position.z; let maxStep = 0, maxPlayerStep = 0, lastW = w.position.clone(), lastP = p.position.clone();
+  walk(p, 0, -1, 2.4, 1.5, 1 / 60, () => { maxStep = Math.max(maxStep, w.position.distanceTo(lastW)); lastW.copy(w.position); maxPlayerStep = Math.max(maxPlayerStep, p.position.distanceTo(lastP)); lastP.copy(p.position); });
+  ok(z0 - w.position.z > 1.0, `REGRESSION grab->W: wheelchair displacement ${(z0 - w.position.z).toFixed(2)} m > 0`);
+  ok(pz0 - p.position.z > 1.0, `player moves forward with it (${(pz0 - p.position.z).toFixed(2)} m)`);
+  ok(Math.hypot(p.position.x - w.position.x, p.position.z - w.position.z) <= 1.15 + 0.02, 'player stays connected (within grip reach)');
+  ok(maxStep < 0.05 && maxPlayerStep < 0.05, `no snap/teleport: max step wheelchair ${maxStep.toFixed(3)} player ${maxPlayerStep.toFixed(3)}`);
+  // release W: player stops, wheelchair decelerates gradually (not instantly, not forever)
+  const v0 = Math.hypot(w.velocity.x, w.velocity.z);
+  p.velocity.set(0, 0, 0);
+  const speeds: number[] = []; walk(p, 0, 0, 0, 3, 1 / 60, () => speeds.push(Math.hypot(w.velocity.x, w.velocity.z)));
+  ok(speeds[speeds.length - 1] === 0 && speeds.some((s) => s > 0.05), `releasing W: wheelchair decelerates to rest (v0 ${v0.toFixed(2)} m/s)`);
+  let monotone = true; for (let i = 1; i < speeds.length; i++) if (speeds[i] > speeds[i - 1] + 1e-6) monotone = false;
+  ok(monotone, 'deceleration is smooth/monotonic (no oscillation)'); }
+// S: backwards drags it
+{ const { p, w } = wheelchairScene(false);
+  const z0 = w.position.z; walk(p, 0, 1, 1.68, 1.5, 1 / 60);
+  ok(w.position.z - z0 > 0.8 && Math.hypot(p.position.x - w.position.x, p.position.z - w.position.z) <= 1.17, `S pulls the wheelchair back ${(w.position.z - z0).toFixed(2)} m, still connected`); }
+// brake ON: W cannot push; brake OFF afterwards: can
+{ const { p, w, state } = wheelchairScene(true);
+  const z0 = w.position.z; walk(p, 0, -1, 2.4, 1.0, 1 / 60);
+  ok(w.position.z === z0, 'brake ON: wheelchair does not move, player does not pass through');
+  state.braked = false; walk(p, 0, -1, 2.4, 1.0, 1 / 60);
+  ok(z0 - w.position.z > 0.8, `brake OFF: now pushable (${(z0 - w.position.z).toFixed(2)} m)`); }
+// A/D strafing while holding: the caregiver stays in the rear lane (steering is by turning), no snap
+{ const { p, w } = wheelchairScene(false); let maxStep = 0, last = w.position.clone(), maxLat = 0;
+  walk(p, 1, 0, 2.4, 1.5, 1 / 60, () => { maxStep = Math.max(maxStep, w.position.distanceTo(last)); last.copy(w.position); maxLat = Math.max(maxLat, Math.abs(p.position.x - w.position.x)); });
+  ok(maxStep < 0.05 && maxLat <= 0.34 && Math.hypot(p.position.x - w.position.x, p.position.z - w.position.z) <= 1.17, `strafe while holding: stays in rear lane (lateral ${maxLat.toFixed(2)} m), no snap (${maxStep.toFixed(3)})`); }
+// Standing beside the chair when grabbed: drawn behind it smoothly, then W pushes it (the doorway failure)
+{ reset(); const p = mkPlayer(0.65, 1.0); physicsWorld.setPlayer(p); const w = body('wc', 0, 1, { ...wcOpts }); w.rotationY = Math.PI; w.group.rotation.y = Math.PI; p.yaw = 0;
+  physicsWorld.attachPlayerJoint(w, 1.15, true); let maxP = 0, last = p.position.clone();
+  const z0 = w.position.z; walk(p, 0, -1, 2.4, 2.0, 1 / 60, () => { maxP = Math.max(maxP, p.position.distanceTo(last)); last.copy(p.position); });
+  ok(z0 - w.position.z > 1.0 && maxP < 0.07, `grabbed from beside: chair still pushed ${(z0 - w.position.z).toFixed(2)} m, no snap (${maxP.toFixed(3)})`); }
+// Yaw follow is rate-limited and never excessive
+{ const { p, w } = wheelchairScene(false); p.yaw = 1.2; const r0 = w.rotationY; walk(p, 0, 0, 0, 0.1, 1 / 60);
+  ok(Math.abs(w.rotationY - r0) <= 2.8 * 0.1 + 1e-3, `wheelchair turn rate-limited (${(w.rotationY - r0).toFixed(3)} rad in 0.1 s)`); }
+// Wall: pushing the held wheelchair into a wall stops both, no overlap
+{ const { p, w } = wheelchairScene(false); let bad = 0;
+  walk(p, 0, -1, 2.4, 6, 1 / 60, () => { if (w.position.z < -5 + 0.34 - 1e-3 || p.position.z < -5 + 0.32 - 1e-3 || Math.hypot(p.position.x - w.position.x, p.position.z - w.position.z) < 0.66 - 1e-3) bad++; });
+  ok(bad === 0 && w.position.z < -4.5, `wall: held wheelchair stops at wall, violations ${bad}, wc z ${w.position.z.toFixed(2)}`);
+  walk(p, 0, 1, 2.4, 2, 1 / 60);
+  ok(w.position.z > -4.0, 'can pull it back out of the wall (player not stuck)'); }
+// Blocked behind (the shipped room layouts): grip from the side where the rear is walled off still moves it forward
+{ reset(); collisionWorld.addBox(V(-1, 0, 1.3), V(1, 0.97, 2.4), 'bed'); // bed right behind the handles
+  const p = mkPlayer(0.9, 1.3); physicsWorld.setPlayer(p); const w = body('wc', 0, 1, { ...wcOpts }); w.rotationY = Math.PI; w.group.rotation.y = Math.PI; p.yaw = 0;
+  physicsWorld.attachPlayerJoint(w, 1.15, true); const z0 = w.position.z;
+  walk(p, 0, -1, 2.4, 1.2, 1 / 60);
+  ok(z0 - w.position.z > 0.3, `blocked grip point does not leave the player stuck (chair moved ${(z0 - w.position.z).toFixed(2)} m)`); }
+// Release: normal walking resumes and chair is no longer constrained
+{ const { p, w } = wheelchairScene(false); walk(p, 0, -1, 2.4, 0.5, 1 / 60); physicsWorld.detachPlayerJoint();
+  const pz = p.position.z; walk(p, 0, 1, 2.4, 2, 1 / 60);
+  ok(p.position.z - pz > 3.5 && Math.hypot(p.position.x - w.position.x, p.position.z - w.position.z) > 1.5, 'after release the player walks away freely (rope gone)'); }
 console.log(fails ? `\n${fails} FAILED` : '\nALL PASSED');
 process.exit(fails ? 1 : 0);

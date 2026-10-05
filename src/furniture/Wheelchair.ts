@@ -74,8 +74,10 @@ export class WheelchairInstance {
   public physicalBody!: PhysicalBody;
   public currentSpeed: number = 0;
   public readonly bodyId: string;
-  public collisionRadius: number = 0.42;
+  public collisionRadius: number = 0.34; // real width ~0.69 m: must fit 0.95 m doors with margin
   public collisionHeight: number = 0.95;
+  /** Max caregiver-to-chair-centre distance while holding (contact is at ~0.66). */
+  public readonly gripReach = 1.15;
   private static readonly EMPTY_MASS = 24;
   private static readonly OCCUPANT_MASS = 65;
 
@@ -328,6 +330,13 @@ export class WheelchairInstance {
     this.physicalBody.mass = WheelchairInstance.EMPTY_MASS + (occupied ? WheelchairInstance.OCCUPANT_MASS : 0);
   }
 
+  /** True when `p` is on the handle side and within arm's reach of the grips. */
+  public canGripFrom(p: THREE.Vector3): boolean {
+    const dx = p.x - this.group.position.x;
+    const dz = p.z - this.group.position.z;
+    return this.isBehind(p) && Math.hypot(dx, dz) <= this.gripReach;
+  }
+
   /** True when `p` stands on the push-handle side (rear half-plane). */
   public isBehind(p: THREE.Vector3): boolean {
     const yaw = this.group.rotation.y;
@@ -374,8 +383,8 @@ export class WheelchairInstance {
       maxDistance: 2.2,
       targetMesh: this.handleHitbox,
       highlightMesh: this.handleMeshes,
-      // Grips are only offered from the rear (so the caregiver never has to walk through the chair)
-      canInteract: () => this.state.isGrabbed || this.isBehind(manager.viewerPosition),
+      // Grips are only offered from the rear and within arm's reach
+      canInteract: () => this.state.isGrabbed || this.canGripFrom(manager.viewerPosition),
       getStateText: () =>
         this.state.isGrabbed
           ? this.state.brakeLocked
